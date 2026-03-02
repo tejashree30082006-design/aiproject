@@ -1,64 +1,102 @@
 import pandas as pd
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
-# Title
+from utils.preprocessing import clean_text
+from utils.matching import compute_similarity
+
+# ---------------------------------
+# Page Config
+# ---------------------------------
+st.set_page_config(page_title="AI Resume Screening", layout="wide")
+
 st.title("AI Resume Screening System")
 
-# Load dataset with FULL PATH
-df = pd.read_csv(r"C:\Users\TEJASHREE\Desktop\resume_project\resumes.csv", low_memory=False)
+# ---------------------------------
+# Load Dataset
+# ---------------------------------
+try:
+    df = pd.read_csv("data/resumes.csv", low_memory=False)
+except FileNotFoundError:
+    st.error("resumes.csv not found inside data folder.")
+    st.stop()
 
-# FIX: Handle NaN values and ensure all resumes are strings
-df['resume'] = df['resume'].fillna('')  # Replace NaN with empty string
-df['resume'] = df['resume'].astype(str)  # Convert everything to string
+# Validate column
+if 'resume' not in df.columns:
+    st.error("CSV must contain a column named 'resume'")
+    st.stop()
 
-# Show dataset preview
-st.write("Dataset Preview")
-st.write(df.head())
+# Clean resumes
+df['resume'] = df['resume'].fillna("").astype(str)
+df['resume'] = df['resume'].apply(clean_text)
 
-# Show basic info (optional - can remove if you don't want to see it)
-st.write(f"Total resumes: {len(df)}")
-st.write(f"Missing values after cleaning: {df['resume'].isna().sum()}")
+st.write(f"Total resumes loaded: {len(df)}")
 
-# Job description input
-job_desc = st.text_area("Enter Job Description")
+# ---------------------------------
+# Job Description Input
+# ---------------------------------
+job_desc = st.text_area("Enter Job Description", height=150)
 
+# ---------------------------------
+# Analyze Button
+# ---------------------------------
 if st.button("Analyze Resumes"):
-    
-    # Check if job description is empty
+
     if not job_desc.strip():
-        st.warning("Please enter a job description")
-    else:
-        with st.spinner("Analyzing resumes..."):
-            try:
-                # Convert text to numbers
-                vectorizer = TfidfVectorizer(stop_words='english')
-                
-                # Fit and transform resumes
-                resume_vectors = vectorizer.fit_transform(df['resume'])
-                
-                # Transform job description
-                job_vector = vectorizer.transform([job_desc])
-                
-                # Calculate similarity
-                similarity = cosine_similarity(resume_vectors, job_vector)
-                
-                # Add scores to dataframe
-                df['Score'] = similarity
-                
-                # Rank resumes
-                ranked = df.sort_values(by='Score', ascending=False)
-                
-                st.success("Analysis Complete!")
-                st.write("Top Matching Candidates")
-                
-                # Show results - check if 'category' column exists
-                if 'category' in df.columns:
-                    st.write(ranked[['category', 'Score']].head(10))
-                else:
-                    # If no category column, just show scores
-                    st.write(ranked[['Score']].head(10))
-                    
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
+        st.warning("Please enter a job description.")
+        st.stop()
+
+    with st.spinner("Analyzing resumes..."):
+
+        # Clean job description
+        job_desc_clean = clean_text(job_desc)
+
+        # TF-IDF Vectorizer
+        vectorizer = TfidfVectorizer(stop_words='english')
+
+        resume_vectors = vectorizer.fit_transform(df['resume'])
+        job_vector = vectorizer.transform([job_desc_clean])
+
+        # Compute similarity
+        df['Score'] = compute_similarity(resume_vectors, job_vector)
+
+        # Sort by score
+        ranked = df.sort_values(by='Score', ascending=False)
+
+        # Take top 10
+        top_results = ranked.head(10).reset_index()
+
+        st.success("Analysis Complete!")
+        st.subheader("Top Matching Candidates")
+
+        # ---------------------------------
+        # Clickable Table
+        # ---------------------------------
+        if 'category' in df.columns:
+            display_df = top_results[['index', 'category', 'Score']]
+        else:
+            display_df = top_results[['index', 'Score']]
+
+        selected = st.dataframe(
+            display_df,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="single-row"
+        )
+
+        # ---------------------------------
+        # Show Selected Resume
+        # ---------------------------------
+        if selected.selection.rows:
+            selected_row = selected.selection.rows[0]
+            actual_index = top_results.loc[selected_row, 'index']
+
+            st.subheader("Selected Resume Details")
+
+            st.text_area(
+                "Resume Content",
+                df.loc[actual_index, 'resume'],
+                height=300
+            )
+
+            st.write("Match Score:", round(df.loc[actual_index, 'Score'], 4))
