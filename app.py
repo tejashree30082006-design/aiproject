@@ -1,129 +1,152 @@
-import pandas as pd
 import streamlit as st
-from sklearn.feature_extraction.text import TfidfVectorizer
+import joblib
+import PyPDF2
+import docx
+
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 from utils.preprocessing import clean_text
-from utils.matching import compute_similarity
 
 
 # ---------------------------------
-# Page Config
+# Page Setup
 # ---------------------------------
+
 st.set_page_config(page_title="AI Resume Screening", layout="wide")
 
 st.title("AI Resume Screening System")
 
+
 # ---------------------------------
-# Load Dataset
+# Load AI Models
 # ---------------------------------
-@st.cache_data
-def load_data():
-    df = pd.read_csv("data/resumes.csv", low_memory=False)
-    return df
 
-try:
-    df = load_data()
-except FileNotFoundError:
-    st.error("resumes.csv not found inside data folder.")
-    st.stop()
+@st.cache_resource
+def load_models():
 
-if "resume" not in df.columns:
-    st.error("CSV must contain a column named 'resume'")
-    st.stop()
+    classifier = joblib.load("resume_classifier.pkl")
+    label_encoder = joblib.load("label_encoder.pkl")
 
-# Clean resumes
-df["resume"] = df["resume"].fillna("").astype(str)
-df["resume"] = df["resume"].apply(clean_text)
+    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-st.write(f"Total resumes loaded: {len(df)}")
+    return classifier, label_encoder, embedding_model
+
+
+classifier, label_encoder, embedding_model = load_models()
 
 
 # ---------------------------------
-# SESSION STATE INITIALIZATION
+# File Reading Functions
 # ---------------------------------
-if "ranked_results" not in st.session_state:
-    st.session_state.ranked_results = None
 
-if "selected_row" not in st.session_state:
-    st.session_state.selected_row = None
+def read_pdf(file):
+
+    pdf_reader = PyPDF2.PdfReader(file)
+
+    text = ""
+
+    for page in pdf_reader.pages:
+        text += page.extract_text()
+
+    return text
+
+
+def read_docx(file):
+
+    doc = docx.Document(file)
+
+    text = ""
+
+    for para in doc.paragraphs:
+        text += para.text
+
+    return text
 
 
 # ---------------------------------
-# Job Description Input
+# Upload Resume
 # ---------------------------------
-job_desc = st.text_area("Enter Job Description", height=150)
+
+uploaded_file = st.file_uploader(
+    "Upload Resume",
+    type=["pdf", "docx"]
+)
+
+job_desc = st.text_area("Enter Job Description", height=200)
 
 
 # ---------------------------------
 # Analyze Button
 # ---------------------------------
-if st.button("Analyze Resumes"):
 
-    if not job_desc.strip():
-        st.warning("Please enter a job description.")
+if st.button("Analyze Resume"):
+
+    if uploaded_file is None:
+
+        st.warning("Please upload a resume")
+
+    elif not job_desc.strip():
+
+        st.warning("Please enter job description")
+
     else:
-        with st.spinner("Analyzing resumes..."):
 
-            job_desc_clean = clean_text(job_desc)
+        # Extract text
 
-            vectorizer = TfidfVectorizer(stop_words="english")
+        if uploaded_file.type == "application/pdf":
 
-            resume_vectors = vectorizer.fit_transform(df["resume"])
-            job_vector = vectorizer.transform([job_desc_clean])
+            resume_text = read_pdf(uploaded_file)
 
-            df["Score"] = compute_similarity(resume_vectors, job_vector)
+        else:
 
-            ranked = df.sort_values(by="Score", ascending=False)
+            resume_text = read_docx(uploaded_file)
 
-            # Store top 10 in session
-            st.session_state.ranked_results = ranked.head(10).reset_index()
-            st.session_state.selected_row = None
+        resume_text = clean_text(resume_text)
+        job_desc = clean_text(job_desc)
 
-        st.success("Analysis Complete!")
+        # -----------------------------
+        # 1️⃣ Category Prediction
+        # -----------------------------
 
+        resume_vector = embedding_model.encode([resume_text])
 
-# ---------------------------------
-# DISPLAY RESULTS (Persistent)
-# ---------------------------------
-if st.session_state.ranked_results is not None:
+        predicted = classifier.predict(resume_vector)
 
-    st.subheader("Top Matching Candidates")
+        category = label_encoder.inverse_transform(predicted)[0]
 
-    results = st.session_state.ranked_results
+        # -----------------------------
+        # 2️⃣ Similarity Matching
+        # -----------------------------
 
-    # Columns to display
-    if "category" in results.columns:
-        display_df = results[["index", "category", "Score"]]
-    else:
-        display_df = results[["index", "Score"]]
+        job_vector = embedding_model.encode([job_desc])
 
-    selected = st.dataframe(
-        display_df,
-        use_container_width=True,
-        on_select="rerun",
-        selection_mode="single-row"
-    )
+        score = cosine_similarity(resume_vector, job_vector)[0][0]
 
-    # Save selected full row (not just index)
-    if selected.selection.rows:
-        row_id = selected.selection.rows[0]
-        st.session_state.selected_row = results.loc[row_id]
+        score = round(score * 100, 2)
 
+        # -----------------------------
+        # Output
+        # -----------------------------
 
-# ---------------------------------
-# SHOW SELECTED RESUME
-# ---------------------------------
-if st.session_state.selected_row is not None:
+        st.subheader("Results")
 
-    row = st.session_state.selected_row
-    resume_index = row["index"]
+        st.write("Predicted Resume Category:", category)
 
-    st.subheader("Selected Resume Details")
+        st.write("Match Score:", f"{score}%")
 
-    st.text_area(
-        "Resume Content",
-        df.loc[resume_index, "resume"],
-        height=300
-    )
+        if score > 70:
 
-    st.write("Match Score:", round(row["Score"], 4))
+            st.success("Strong Match")
+
+        elif score > 40:
+
+            st.warning("Moderate Match")
+
+        else:
+
+            st.error("Weak Match")
+
+        st.subheader("Extracted Resume Text")
+
+        st.text_area("", resume_text, height=300)
