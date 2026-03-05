@@ -1,7 +1,9 @@
 import streamlit as st
 import joblib
-import PyPDF2
+import pdfplumber
 import docx
+import numpy as np
+import google.generativeai as genai
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -9,18 +11,21 @@ from sklearn.metrics.pairwise import cosine_similarity
 from utils.preprocessing import clean_text
 
 
-# ---------------------------------
-# Page Setup
-# ---------------------------------
+# -----------------------------
+# PAGE CONFIG
+# -----------------------------
 
-st.set_page_config(page_title="AI Resume Screening", layout="wide")
+st.set_page_config(
+    page_title="AI Resume Screening",
+    layout="wide"
+)
 
 st.title("AI Resume Screening System")
 
 
-# ---------------------------------
-# Load AI Models
-# ---------------------------------
+# -----------------------------
+# LOAD MODELS
+# -----------------------------
 
 @st.cache_resource
 def load_models():
@@ -36,117 +41,155 @@ def load_models():
 classifier, label_encoder, embedding_model = load_models()
 
 
-# ---------------------------------
-# File Reading Functions
-# ---------------------------------
+# -----------------------------
+# GEMINI CONFIG
+# -----------------------------
 
-def read_pdf(file):
+GEMINI_API_KEY = "GEMINI_API_KEY"
 
-    pdf_reader = PyPDF2.PdfReader(file)
+genai.configure(api_key=GEMINI_API_KEY)
+
+gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+
+
+# -----------------------------
+# FILE READING FUNCTIONS
+# -----------------------------
+
+def extract_pdf(file):
 
     text = ""
 
-    for page in pdf_reader.pages:
-        text += page.extract_text()
+    with pdfplumber.open(file) as pdf:
+
+        for page in pdf.pages:
+            text += page.extract_text() or ""
 
     return text
 
 
-def read_docx(file):
+def extract_docx(file):
 
     doc = docx.Document(file)
 
-    text = ""
+    text = []
 
     for para in doc.paragraphs:
-        text += para.text
+        text.append(para.text)
 
-    return text
+    return "\n".join(text)
 
 
-# ---------------------------------
-# Upload Resume
-# ---------------------------------
+# -----------------------------
+# FILE UPLOAD
+# -----------------------------
 
 uploaded_file = st.file_uploader(
-    "Upload Resume",
+    "Upload Resume (PDF or DOCX)",
     type=["pdf", "docx"]
 )
 
-job_desc = st.text_area("Enter Job Description", height=200)
+job_description = st.text_area(
+    "Enter Job Description",
+    height=200
+)
 
 
-# ---------------------------------
-# Analyze Button
-# ---------------------------------
+# -----------------------------
+# ANALYSIS BUTTON
+# -----------------------------
 
 if st.button("Analyze Resume"):
 
     if uploaded_file is None:
+        st.warning("Please upload a resume.")
 
-        st.warning("Please upload a resume")
-
-    elif not job_desc.strip():
-
-        st.warning("Please enter job description")
+    elif not job_description.strip():
+        st.warning("Please enter job description.")
 
     else:
 
-        # Extract text
+        with st.spinner("Analyzing resume..."):
 
-        if uploaded_file.type == "application/pdf":
+            # -----------------------------
+            # Extract resume text
+            # -----------------------------
 
-            resume_text = read_pdf(uploaded_file)
+            if uploaded_file.type == "application/pdf":
+                resume_text = extract_pdf(uploaded_file)
 
-        else:
+            else:
+                resume_text = extract_docx(uploaded_file)
 
-            resume_text = read_docx(uploaded_file)
+            resume_text = clean_text(resume_text)
+            job_description_clean = clean_text(job_description)
 
-        resume_text = clean_text(resume_text)
-        job_desc = clean_text(job_desc)
+            # -----------------------------
+            # Create embeddings
+            # -----------------------------
 
-        # -----------------------------
-        # 1️⃣ Category Prediction
-        # -----------------------------
+            resume_vec = embedding_model.encode([resume_text])
+            job_vec = embedding_model.encode([job_description_clean])
 
-        resume_vector = embedding_model.encode([resume_text])
+            # -----------------------------
+            # Similarity Score
+            # -----------------------------
 
-        predicted = classifier.predict(resume_vector)
+            similarity = cosine_similarity(resume_vec, job_vec)[0][0]
 
-        category = label_encoder.inverse_transform(predicted)[0]
+            # -----------------------------
+            # Predict Resume Category
+            # -----------------------------
 
-        # -----------------------------
-        # 2️⃣ Similarity Matching
-        # -----------------------------
+            prediction = classifier.predict(resume_vec)
+            category = label_encoder.inverse_transform(prediction)[0]
 
-        job_vector = embedding_model.encode([job_desc])
+            # -----------------------------
+            # Display Results
+            # -----------------------------
 
-        score = cosine_similarity(resume_vector, job_vector)[0][0]
+            st.subheader("AI Analysis")
 
-        score = round(score * 100, 2)
+            col1, col2 = st.columns(2)
 
-        # -----------------------------
-        # Output
-        # -----------------------------
+            with col1:
+                st.metric(
+                    label="Resume Category",
+                    value=category
+                )
 
-        st.subheader("Results")
+            with col2:
+                st.metric(
+                    label="Job Match Score",
+                    value=f"{round(similarity*100,2)} %"
+                )
 
-        st.write("Predicted Resume Category:", category)
+            # -----------------------------
+            # Gemini Explanation
+            # -----------------------------
 
-        st.write("Match Score:", f"{score}%")
+            prompt = f"""
 
-        if score > 70:
+You are an AI hiring assistant.
 
-            st.success("Strong Match")
+Job Description:
+{job_description}
 
-        elif score > 40:
+Resume:
+{resume_text[:2000]}
 
-            st.warning("Moderate Match")
+Explain:
 
-        else:
+1. Why this resume matches or doesn't match the job.
+2. Strengths of the candidate.
+3. Missing skills.
+4. Final hiring recommendation.
 
-            st.error("Weak Match")
+Keep explanation professional and structured.
+"""
 
-        st.subheader("Extracted Resume Text")
+            response = gemini_model.generate_content(prompt)
 
-        st.text_area("", resume_text, height=300)
+            st.subheader("AI Hiring Explanation")
+
+            st.write(response.text)
