@@ -327,7 +327,7 @@ with tab2:
                     # Gemini explanation — only if API key is set
                     try:
                         import google.generativeai as genai
-                        GEMINI_API_KEY = "AIzaSyDb0C7XctW10eN1FbO5jBqffQ7YvWD9m5I"   # ← replace
+                        GEMINI_API_KEY = "GEMINI_API_KEY"   # ← replace
                         genai.configure(api_key=GEMINI_API_KEY)
                         gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
