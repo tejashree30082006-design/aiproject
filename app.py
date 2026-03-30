@@ -688,7 +688,7 @@ Keep it structured, professional, and concise.
 
                             try:
                                 import google.generativeai as genai
-                                GEMINI_API_KEY = "AIzaSyCaImY5GJzxboU276xg6rkOF41brClZvI8"   # ← replace
+                                GEMINI_API_KEY = "GEMINI_API_KEY"   # ← replace
                                 genai.configure(api_key=GEMINI_API_KEY)
                                 gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
