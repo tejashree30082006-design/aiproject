@@ -1,0 +1,18 @@
+# Models (large binary files)
+models/*.pkl
+models/*.bin
+models/skill_index.json
+
+# Datasets
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# Streamlit
+.streamlit/secrets.toml
