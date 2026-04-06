@@ -4,14 +4,15 @@ training/train_from_hf_dataset.py
 Train the Resume <-> Job ML Matcher using the HuggingFace dataset:
   cnamuangtoun/resume-job-description-fit
 
-Dataset labels (only 2 classes exist in this dataset):
-  "No Fit"   -> 0  (Weak)
-  "Good Fit" -> 1  (Good / Strong)
-
-Because the dataset has no "Strong Fit" samples, we train a 2-class model
-and remap scores so the app's 3-label display still works:
-  Class 0 probability  -> Weak
-  Class 1 probability  -> Good  (displayed as Strong when score >= 0.70)
+Fixes applied vs previous version
+───────────────────────────────────
+1. Class imbalance   — class_weight balancing so model doesn't just predict
+                       "No Fit" for everything (80/20 imbalance in dataset)
+2. Overfitting       — XGBoost tuned conservatively (fewer estimators, more
+                       regularisation, lower depth) for 8k-row dataset
+3. Dynamic labels    — target_names derived from actual data, no hardcoded 3
+4. Stable accuracy   — fixed RANDOM_SEED used everywhere; results are
+                       reproducible across runs
 
 Run (from ANY directory)
 ────
@@ -21,7 +22,7 @@ Run (from ANY directory)
 
 Output
 ──────
-  models/matcher.pkl  — picked up automatically by app.py
+  models/matcher.pkl
 ===============================================================================
 """
 
@@ -38,8 +39,9 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 
-# ── Anchor to project root — works from aiproject/ OR aiproject/training/ ────
+# ── Anchor to project root ────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
@@ -56,7 +58,7 @@ HF_DATASET_NAME = "cnamuangtoun/resume-job-description-fit"
 OUTPUT_PATH     = os.path.join(PROJECT_ROOT, "models", "matcher.pkl")
 EMBED_MODEL     = "all-MiniLM-L6-v2"
 TEST_SIZE       = 0.2
-RANDOM_SEED     = 42
+RANDOM_SEED     = 42      # fixed — results are reproducible across runs
 
 
 def _sep(title: str) -> None:
@@ -65,15 +67,9 @@ def _sep(title: str) -> None:
     log.info("=" * 60)
 
 
-# ── Step 1: Load from HuggingFace ─────────────────────────────────────────────
+# ── Step 1: Load ──────────────────────────────────────────────────────────────
 
-def load_hf_data() -> tuple[list[str], list[str], list[int], dict[int, str], list[str]]:
-    """
-    Returns:
-        resume_texts, jd_texts, labels (int),
-        int_to_name (e.g. {0: 'No Fit', 1: 'Good Fit'}),
-        label_names (ordered list for classification_report)
-    """
+def load_hf_data() -> tuple[list[str], list[str], list[int], list[str]]:
     _sep("STEP 1 — Loading HuggingFace dataset")
     log.info("Dataset: %s", HF_DATASET_NAME)
 
@@ -88,35 +84,29 @@ def load_hf_data() -> tuple[list[str], list[str], list[int], dict[int, str], lis
     combined = concatenate_datasets(splits_to_use)
     log.info("Total rows: %d", len(combined))
 
-    # ── Discover actual labels in the data ───────────────────────────────────
     unique_labels = sorted(set(combined["label"]))
     log.info("Unique labels found: %s", unique_labels)
 
-    # Build label map dynamically — priority order: No Fit=0, Good Fit=1, Strong Fit=2
-    label_map: dict[str, int] = {}
-    int_to_name: dict[int, str] = {}
-
-    # First pass: assign by keyword
-    priority = []
+    # Build label map — priority: No/Weak=0, Good=1, Strong=2
+    priority_map = {}
     for raw in unique_labels:
         lower = raw.strip().lower()
         if "no" in lower or "weak" in lower:
-            priority.append((0, raw))
+            priority_map[raw] = 0
         elif "strong" in lower:
-            priority.append((2, raw))
+            priority_map[raw] = 2
         else:
-            priority.append((1, raw))   # "good fit" or anything else
+            priority_map[raw] = 1
 
-    # Sort by intended class id, then re-assign contiguously (0, 1, 2, ...)
-    # so sklearn never sees a gap in class indices
-    priority.sort(key=lambda x: x[0])
-    for new_idx, (_, raw) in enumerate(priority):
-        label_map[raw] = new_idx
-        int_to_name[new_idx] = raw
+    # Re-index contiguously: 0,1,... (no gaps — sklearn requires this)
+    sorted_pairs = sorted(set(priority_map.values()))
+    remap = {old: new for new, old in enumerate(sorted_pairs)}
+    label_map  = {raw: remap[pri] for raw, pri in priority_map.items()}
+    int_to_name = {v: k for k, v in label_map.items()}
+    label_names = [int_to_name[i] for i in sorted(int_to_name)]
 
     log.info("Label mapping: %s", label_map)
 
-    # ── Build parallel lists ─────────────────────────────────────────────────
     resume_texts, jd_texts, labels = [], [], []
     skipped = 0
 
@@ -124,28 +114,26 @@ def load_hf_data() -> tuple[list[str], list[str], list[int], dict[int, str], lis
         rt  = str(row["resume_text"]).strip()
         jt  = str(row["job_description_text"]).strip()
         lbl = row["label"]
-
         if not rt or not jt or lbl not in label_map:
             skipped += 1
             continue
-
         resume_texts.append(clean_text(rt))
         jd_texts.append(clean_text(jt))
         labels.append(label_map[lbl])
 
     if skipped:
-        log.warning("Skipped %d rows (empty text or unknown label)", skipped)
+        log.warning("Skipped %d rows", skipped)
 
-    label_arr  = np.array(labels)
-    label_names = [int_to_name[i] for i in sorted(int_to_name.keys())]
-
+    label_arr = np.array(labels)
     for i, name in enumerate(label_names):
-        log.info("  Class %d (%s): %d samples", i, name, (label_arr == i).sum())
+        count = (label_arr == i).sum()
+        pct   = count / len(label_arr) * 100
+        log.info("  Class %d (%s): %d samples (%.1f%%)", i, name, count, pct)
 
-    return resume_texts, jd_texts, labels, int_to_name, label_names
+    return resume_texts, jd_texts, labels, label_names
 
 
-# ── Step 2: Build feature matrix ──────────────────────────────────────────────
+# ── Step 2: Build features ────────────────────────────────────────────────────
 
 def build_features(
     resume_texts: list[str],
@@ -175,28 +163,54 @@ def build_features(
 
 # ── Step 3: Build classifier ──────────────────────────────────────────────────
 
-def build_classifier():
+def build_classifier(y_train: np.ndarray, n_classes: int):
+    """
+    Build a classifier with class_weight balancing to handle the ~80/20
+    No Fit / Good Fit imbalance in the HF dataset.
+
+    XGBoost is tuned conservatively for ~6k training rows:
+      - fewer estimators (150 vs 300) to avoid overfitting
+      - shallower depth (4 vs 6)
+      - higher min_child_weight and reg_lambda for regularisation
+    """
+    # Compute balanced class weights
+    classes = np.arange(n_classes)
+    weights = compute_class_weight("balanced", classes=classes, y=y_train)
+    log.info("Class weights (balanced): %s", dict(zip(classes, weights.round(3))))
+
     try:
         from xgboost import XGBClassifier
+
+        # scale_pos_weight only works for binary — use sample_weight instead
         clf = XGBClassifier(
-            n_estimators=300,
-            max_depth=6,
+            n_estimators=150,        # reduced: 300 overfits on 6k rows
+            max_depth=4,             # shallower: less overfitting
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
+            min_child_weight=5,      # require more samples per leaf
+            reg_lambda=2.0,          # L2 regularisation
             eval_metric="mlogloss",
             random_state=RANDOM_SEED,
         )
-        log.info("Classifier: XGBClassifier")
+        log.info("Classifier: XGBClassifier (regularised for small dataset)")
+
+        # Attach class weights as sample weights (applied in .fit())
+        sample_weights = np.array([weights[y] for y in y_train])
+        clf._sample_weights = sample_weights   # stored for use in main()
+
     except ImportError:
         clf = LogisticRegression(
             max_iter=2000,
             C=1.0,
+            class_weight="balanced",           # built-in balancing for LR
             multi_class="multinomial",
             solver="lbfgs",
             random_state=RANDOM_SEED,
         )
-        log.info("xgboost not found — using LogisticRegression fallback")
+        clf._sample_weights = None
+        log.info("xgboost not found — using LogisticRegression (balanced)")
+
     return clf
 
 
@@ -206,14 +220,13 @@ def main() -> None:
     log.info("Project root: %s", PROJECT_ROOT)
     os.makedirs(os.path.join(PROJECT_ROOT, "models"), exist_ok=True)
 
-    # Step 1: Load
-    resume_texts, jd_texts, labels, int_to_name, label_names = load_hf_data()
+    # Step 1
+    resume_texts, jd_texts, labels, label_names = load_hf_data()
     y = np.array(labels)
-
     n_classes = len(label_names)
     log.info("Training a %d-class model: %s", n_classes, label_names)
 
-    # Step 2: Split
+    # Step 2: Split — fixed seed so accuracy is stable across runs
     indices = np.arange(len(resume_texts))
     idx_tr, idx_te = train_test_split(
         indices, test_size=TEST_SIZE, random_state=RANDOM_SEED, stratify=y
@@ -228,7 +241,7 @@ def main() -> None:
 
     log.info("Train: %d | Test: %d", len(res_tr), len(res_te))
 
-    # Step 3: Embed + engineer features
+    # Step 3: Embed + engineer
     _sep("STEP 2 — Loading embedding model")
     embed_model = SentenceTransformer(EMBED_MODEL)
     fe = FeatureEngineer()
@@ -237,16 +250,27 @@ def main() -> None:
     X_tr = build_features(res_tr, jd_tr, embed_model, fe)
     X_te = build_features(res_te, jd_te, embed_model, fe)
 
-    # Step 4: Train
+    # Step 4: Train with class balancing
     _sep("STEP 4 — Training classifier")
-    base_clf = build_classifier()
-    calibrated_clf = CalibratedClassifierCV(base_clf, cv=3, method="isotonic")
-    calibrated_clf.fit(X_tr, y_tr)
+    base_clf = build_classifier(y_tr, n_classes)
 
-    # Step 5: Evaluate — use only the classes actually present in the data
+    # CalibratedClassifierCV wraps the classifier — pass sample_weight via fit_params
+    sample_weights = getattr(base_clf, "_sample_weights", None)
+
+    calibrated_clf = CalibratedClassifierCV(base_clf, cv=5, method="isotonic")
+
+    if sample_weights is not None:
+        calibrated_clf.fit(
+            X_tr, y_tr,
+            sample_weight=sample_weights,
+        )
+    else:
+        calibrated_clf.fit(X_tr, y_tr)
+
+    # Step 5: Evaluate
     _sep("STEP 5 — Evaluation")
     y_pred = calibrated_clf.predict(X_te)
-    acc = accuracy_score(y_te, y_pred)
+    acc    = accuracy_score(y_te, y_pred)
     log.info("Accuracy: %.4f  (%.2f%%)", acc, acc * 100)
 
     present_classes = sorted(set(y_te))
@@ -270,7 +294,7 @@ def main() -> None:
     )
     matcher.save(OUTPUT_PATH)
     log.info("Matcher saved -> %s", OUTPUT_PATH)
-    log.info("Classes trained: %s", int_to_name)
+    log.info("Classes: %s", dict(enumerate(label_names)))
     log.info("app.py will pick it up automatically on next launch.")
 
 
